@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "omniroute/auto",
+  "description": "Hermes-Config-Backup OpenCode Project",
+  "commands": {
+    "test": {
+      "description": "Run pytest unit and integration tests for the backup plugin",
+      "template": "Run the test suite using pytest with coverage."
+    },
+    "backup-run": {
+      "description": "Trigger an immediate backup test run",
+      "template": "Execute the backup script manually to verify backup creation and rotation."
+    }
+  },
+  "instructions": [
+    "README.md",
+    "plugin.yaml"
+  ]
+}

@@ -1,0 +1,14 @@
+name: config_backup
+version: 0.1.0
+description: Automatically compresses and backs up Hermes configuration, checks size variance against the last 3 backups on launch, and warns if it shifts by 20% or more.
+author: Christopher Pete Miller
+settings:
+  backup_enabled: true
+  backup_interval_hours: 24
+  backup_destination: "~/hermes_backups"
+  max_backups_to_keep: 30
+ui:
+  actions:
+    - id: trigger_backup
+      label: "Backup Now"
+      description: "Immediately create a zip archive of current Hermes configurations"
