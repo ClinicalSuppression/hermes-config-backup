@@ -47,7 +47,7 @@ def test_create_zip_backup(tmp_path, mock_hermes_home, monkeypatch):
     dest_dir = tmp_path / "backups"
     
     plugin = ConfigBackupPlugin()
-    backup_path = plugin.run_backup_sync(dest_dir)
+    backup_path = plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
     
     assert backup_path.exists()
     assert backup_path.suffix == ".zip"
@@ -132,9 +132,100 @@ def test_atomic_backup_no_temp_leftover(tmp_path, mock_hermes_home, monkeypatch)
     dest_dir = tmp_path / "backups"
     
     plugin = ConfigBackupPlugin()
-    backup_path = plugin.run_backup_sync(dest_dir)
-    
+    backup_path = plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
     assert backup_path.exists()
     # Check no .tmp files remain in dest_dir
     tmp_files = list(dest_dir.glob("*.tmp"))
     assert len(tmp_files) == 0
+
+def test_checksum_verification_and_integrity_audit(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    backup_path = plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    assert plugin._verify_backup_checksum(backup_path) is True
+
+    # Corrupt the archive after checksum generation.
+    with open(backup_path, "ab") as f:
+        f.write(b"corruption")
+
+    assert plugin._verify_backup_checksum(backup_path) is False
+
+    ctx.notifications.clear()
+    plugin._audit_backups_integrity(dest_dir)
+    assert any("integrity check failed" in payload["message"].lower() for payload in ctx.notifications)
+
+def test_health_status_metrics(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    health = plugin.get_health_status()
+    assert health["backup_count"] == 1
+    assert health["total_size_bytes"] > 0
+    assert health["integrity_verified_count"] == 1
+    assert health["integrity_failed_count"] == 0
+    assert health["latest_backup"] is not None
+
+def test_restore_action_requires_explicit_confirmation(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    result = plugin.handle_action("restore_latest", {})
+    assert result["status"] == "confirmation_required"
+    assert result["requires_confirmation"] is True
+
+def test_restore_action_rejects_invalid_checksum(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    backup_path = plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+    with open(backup_path, "ab") as f:
+        f.write(b"corruption")
+
+    result = plugin.handle_action("restore_latest", {"confirm": True})
+    assert result["status"] == "error"
+
+def test_restore_latest_creates_safety_snapshot_and_restores(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    # Change active config before restoring.
+    (mock_hermes_home / "config.yaml").write_text("changed: true", encoding="utf-8")
+
+    result = plugin.handle_action("restore_latest", {"confirm": True})
+    assert result["status"] == "success"
+    assert (mock_hermes_home / "config.yaml").read_text(encoding="utf-8") == "model: omniroute"
+
+    snapshots = list((dest_dir / "restore_snapshots").glob("hermes_config_backup_*.zip"))
+    assert len(snapshots) == 1
+    assert plugin._verify_backup_checksum(snapshots[0])
+
+def test_health_status_action_returns_data(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    result = plugin.handle_action("health_status")
+    assert result["status"] == "success"
+    assert result["data"]["backup_count"] == 1
