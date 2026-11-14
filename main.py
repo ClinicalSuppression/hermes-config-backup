@@ -14,7 +14,7 @@ class ConfigBackupPlugin:
         self._lock = threading.Lock()
 
     def initialize(self):
-        logger.info("Initializing Config Backup Plugin v0.2.0 (Max Backups: 30, Checksums: Enabled, Integrity Audits: Enabled)...")
+        logger.info("Initializing Config Backup Plugin v0.2.1 (Max Backups: 30, Checksums: Enabled, Integrity Audits: Enabled)...")
         # Run startup check and creation in a background thread to prevent blocking gateway boot
         threading.Thread(target=self._startup_backup_and_check, daemon=True).start()
         self._start_timer_thread()
@@ -41,9 +41,18 @@ class ConfigBackupPlugin:
                 }
 
             backup_name = payload.get("backup_name") if isinstance(payload, dict) else None
-            if self.restore_backup(backup_name):
-                return {"status": "success", "message": "Successfully restored Hermes configuration from backup."}
-            return {"status": "error", "message": "Failed to restore backup. See logs for details."}
+
+            # Validate the target synchronously so the UI gets an immediate answer...
+            settings = self._get_settings()
+            target_backup = self._select_backup(Path(settings["destination"]), backup_name)
+            if target_backup is None:
+                return {"status": "error", "message": "No matching backup found to restore."}
+            if not self._verify_backup_checksum(target_backup):
+                return {"status": "error", "message": "Backup checksum verification failed. Restore aborted."}
+
+            # ...then run the heavy restore work off the UI thread.
+            threading.Thread(target=self._restore_worker, args=(backup_name,), daemon=True).start()
+            return {"status": "success", "message": f"Restore of {target_backup.name} started in the background."}
         if action_id == "health_status":
             return {"status": "success", "data": self.get_health_status()}
         return {"status": "ignored"}
@@ -64,11 +73,17 @@ class ConfigBackupPlugin:
         except (TypeError, ValueError):
             max_keep = 30
 
+        try:
+            max_restore_snapshots = int(cfg.get("max_restore_snapshots_to_keep", 5))
+        except (TypeError, ValueError):
+            max_restore_snapshots = 5
+
         return {
             "enabled": bool(cfg.get("backup_enabled", True)),
             "interval_hours": max(interval, 0.1),
             "destination": os.path.expanduser(cfg.get("backup_destination", "~/hermes_backups")),
-            "max_keep": max(max_keep, 1)
+            "max_keep": max(max_keep, 1),
+            "max_restore_snapshots": max(max_restore_snapshots, 1)
         }
 
     def _get_existing_backups(self, dest_dir: Path):
@@ -304,28 +319,29 @@ class ConfigBackupPlugin:
             "destination": str(dest_dir)
         }
 
+    def _select_backup(self, dest_dir: Path, backup_name: str = None):
+        """Find the newest backup, or a specific one by name. Returns None if not found."""
+        backups = self._get_existing_backups(dest_dir)
+        if not backups:
+            return None
+        if backup_name:
+            for backup_path in backups:
+                if backup_path.name == backup_name:
+                    return backup_path
+            return None
+        return backups[0]
+
     def restore_backup(self, backup_name: str = None) -> bool:
         """Restore a verified backup into HERMES_HOME after creating a safety snapshot."""
         with self._lock:
             settings = self._get_settings()
             dest_dir = Path(settings["destination"])
-            backups = self._get_existing_backups(dest_dir)
 
-            if not backups:
-                logger.error("No backups available to restore.")
+            target_backup = self._select_backup(dest_dir, backup_name)
+            if target_backup is None:
+                logger.error(f"No backups available to restore." if not backup_name
+                             else f"Requested backup {backup_name} not found.")
                 return False
-
-            target_backup = None
-            if backup_name:
-                for backup_path in backups:
-                    if backup_path.name == backup_name:
-                        target_backup = backup_path
-                        break
-                if not target_backup:
-                    logger.error(f"Requested backup {backup_name} not found.")
-                    return False
-            else:
-                target_backup = backups[0]
 
             if not self._verify_backup_checksum(target_backup):
                 logger.error(f"Cannot restore {target_backup.name}: checksum verification failed.")
@@ -341,6 +357,9 @@ class ConfigBackupPlugin:
             except Exception as e:
                 logger.error(f"Refusing restore because safety snapshot failed: {e}")
                 return False
+
+            # Keep restore snapshot storage bounded.
+            self._prune_restore_snapshots(safety_dest, settings["max_restore_snapshots"])
 
             try:
                 # Extract into a staging directory first to validate the archive safely.
@@ -364,6 +383,35 @@ class ConfigBackupPlugin:
             except Exception as e:
                 logger.error(f"Failed to restore backup {target_backup.name}: {e}")
                 return False
+
+    def _restore_worker(self, backup_name: str = None):
+        """Background wrapper so restore work never blocks the UI thread."""
+        try:
+            if self.restore_backup(backup_name):
+                logger.info("Background restore completed successfully.")
+            else:
+                self._notify_user("Backup restore failed. See plugin logs for details.")
+        except Exception as e:
+            logger.error(f"Background restore crashed: {e}")
+
+    def _prune_restore_snapshots(self, snapshot_dir: Path, keep: int):
+        """Keep only the newest N pre-restore safety snapshots."""
+        if keep <= 0:
+            return
+        try:
+            snapshots = sorted(snapshot_dir.glob("hermes_config_backup_*.zip"), key=os.path.getmtime, reverse=True)
+        except Exception as e:
+            logger.warning(f"Failed to list restore snapshots: {e}")
+            return
+        for old_snapshot in snapshots[keep:]:
+            try:
+                sha_sidecar = snapshot_dir / f"{old_snapshot.name}.sha256"
+                if sha_sidecar.exists():
+                    sha_sidecar.unlink()
+                old_snapshot.unlink()
+                logger.info(f"Pruned old restore snapshot: {old_snapshot.name}")
+            except Exception as e:
+                logger.warning(f"Could not delete restore snapshot {old_snapshot.name}: {e}")
 
     def _start_timer_thread(self):
         def loop():

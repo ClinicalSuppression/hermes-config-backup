@@ -1,12 +1,13 @@
 name: config_backup
-version: 0.2.0
-description: Automatically compresses and backs up Hermes configuration, validates SHA256 checksums, audits bitrot integrity, and supports one-click restoration and health reporting.
+version: 0.2.1
+description: Automatically compresses and backs up Hermes configuration, validates SHA256 checksums, audits bitrot integrity, and supports confirmed background restore with bounded pre-restore safety snapshots.
 author: Christopher Pete Miller
 settings:
   backup_enabled: true
   backup_interval_hours: 24
   backup_destination: "~/hermes_backups"
   max_backups_to_keep: 30
+  max_restore_snapshots_to_keep: 5
 ui:
   actions:
     - id: trigger_backup
@@ -14,7 +15,7 @@ ui:
       description: "Immediately create a zip archive of current Hermes configurations"
     - id: restore_latest
       label: "Restore Latest Backup"
-      description: "Restore Hermes configuration from the latest verified backup archive"
+      description: "Restore Hermes configuration from the latest verified backup archive (requires confirmation, runs in background)"
     - id: health_status
       label: "Backup Health Status"
       description: "Inspect backup disk usage, file count, and integrity health"

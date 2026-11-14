@@ -186,6 +186,38 @@ def test_restore_action_requires_explicit_confirmation(tmp_path, mock_hermes_hom
     assert result["status"] == "confirmation_required"
     assert result["requires_confirmation"] is True
 
+def test_restore_action_rejects_unknown_backup_name(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+    plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    result = plugin.handle_action("restore_latest", {"confirm": True, "backup_name": "missing.zip"})
+    assert result["status"] == "error"
+
+def test_restore_snapshot_pruning(tmp_path):
+    dest_dir = tmp_path / "backups"
+    snapshot_dir = dest_dir / "restore_snapshots"
+    snapshot_dir.mkdir(parents=True)
+
+    plugin = ConfigBackupPlugin()
+    snapshots = []
+    for i in range(7):
+        snap = snapshot_dir / f"hermes_config_backup_2026110{i+1}_120000.zip"
+        snap.write_text(f"snapshot {i}", encoding="utf-8")
+        (snapshot_dir / f"{snap.name}.sha256").write_text("abc  " + snap.name, encoding="utf-8")
+        time.sleep(0.01)
+        snapshots.append(snap)
+
+    plugin._prune_restore_snapshots(snapshot_dir, keep=3)
+
+    remaining = list(snapshot_dir.glob("*.zip"))
+    assert len(remaining) == 3
+    assert all(s in remaining for s in snapshots[-3:])
+    assert not any((snapshot_dir / f"{s.name}.sha256").exists() for s in snapshots[:-3])
+
 def test_restore_action_rejects_invalid_checksum(tmp_path, mock_hermes_home, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
     dest_dir = tmp_path / "backups"
@@ -212,7 +244,16 @@ def test_restore_latest_creates_safety_snapshot_and_restores(tmp_path, mock_herm
 
     result = plugin.handle_action("restore_latest", {"confirm": True})
     assert result["status"] == "success"
-    assert (mock_hermes_home / "config.yaml").read_text(encoding="utf-8") == "model: omniroute"
+
+    # Restore now runs in a background worker; wait for it to finish.
+    deadline = time.time() + 10
+    restored = False
+    while time.time() < deadline:
+        if (mock_hermes_home / "config.yaml").read_text(encoding="utf-8") == "model: omniroute":
+            restored = True
+            break
+        time.sleep(0.05)
+    assert restored, "background restore did not complete within timeout"
 
     snapshots = list((dest_dir / "restore_snapshots").glob("hermes_config_backup_*.zip"))
     assert len(snapshots) == 1
