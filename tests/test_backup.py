@@ -5,6 +5,17 @@ import pytest
 from pathlib import Path
 from main import ConfigBackupPlugin
 
+class MockContext:
+    def __init__(self, config_data):
+        self.config_data = config_data
+        self.notifications = []
+
+    def get_config(self):
+        return self.config_data
+
+    def notify(self, payload):
+        self.notifications.append(payload)
+
 @pytest.fixture
 def mock_hermes_home(tmp_path):
     hermes_home = tmp_path / ".hermes"
@@ -94,3 +105,36 @@ def test_handle_action():
     
     res_ignored = plugin.handle_action("unknown_action")
     assert res_ignored["status"] == "ignored"
+
+def test_type_safe_settings_parsing():
+    # Test malformed config values fall back gracefully
+    ctx = MockContext({
+        "plugins": {
+            "config_backup": {
+                "backup_enabled": "not_a_bool",
+                "backup_interval_hours": "invalid_float",
+                "max_backups_to_keep": "invalid_int",
+                "backup_destination": "~/test_dest"
+            }
+        }
+    })
+    plugin = ConfigBackupPlugin(context=ctx)
+    settings = plugin._get_settings()
+    
+    assert isinstance(settings["enabled"], bool)
+    assert isinstance(settings["interval_hours"], float)
+    assert isinstance(settings["max_keep"], int)
+    assert settings["interval_hours"] == 24.0
+    assert settings["max_keep"] == 30
+
+def test_atomic_backup_no_temp_leftover(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+    
+    plugin = ConfigBackupPlugin()
+    backup_path = plugin.run_backup_sync(dest_dir)
+    
+    assert backup_path.exists()
+    # Check no .tmp files remain in dest_dir
+    tmp_files = list(dest_dir.glob("*.tmp"))
+    assert len(tmp_files) == 0

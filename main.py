@@ -11,6 +11,7 @@ class ConfigBackupPlugin:
         self.context = context
         self._stop_event = threading.Event()
         self._thread = None
+        self._lock = threading.Lock()
 
     def initialize(self):
         logger.info("Initializing Config Backup Plugin v0.1.1 (Max Backups: 30, Checksums: Enabled)...")
@@ -38,70 +39,103 @@ class ConfigBackupPlugin:
         else:
             cfg = {}
         
+        try:
+            interval = float(cfg.get("backup_interval_hours", 24))
+        except (TypeError, ValueError):
+            interval = 24.0
+
+        try:
+            max_keep = int(cfg.get("max_backups_to_keep", 30))
+        except (TypeError, ValueError):
+            max_keep = 30
+
         return {
-            "enabled": cfg.get("backup_enabled", True),
-            "interval_hours": float(cfg.get("backup_interval_hours", 24)),
+            "enabled": bool(cfg.get("backup_enabled", True)),
+            "interval_hours": max(interval, 0.1),
             "destination": os.path.expanduser(cfg.get("backup_destination", "~/hermes_backups")),
-            "max_keep": int(cfg.get("max_backups_to_keep", 30))
+            "max_keep": max(max_keep, 1)
         }
 
     def _get_existing_backups(self, dest_dir: Path):
         if not dest_dir.exists():
             return []
-        return sorted(dest_dir.glob("hermes_config_backup_*.zip"), key=os.path.getmtime, reverse=True)
+        try:
+            return sorted(dest_dir.glob("hermes_config_backup_*.zip"), key=os.path.getmtime, reverse=True)
+        except Exception as e:
+            logger.warning(f"Failed to list existing backups: {e}")
+            return []
 
     def _create_zip_backup(self, dest_dir: Path) -> Path:
         dest_dir.mkdir(parents=True, exist_ok=True)
         hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
         
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        backup_path = dest_dir / f"hermes_config_backup_{timestamp}.zip"
+        final_backup_path = dest_dir / f"hermes_config_backup_{timestamp}.zip"
+        tmp_backup_path = dest_dir / f"hermes_config_backup_{timestamp}.zip.tmp"
         
         excluded_dirs = {"cache", "logs", "sandboxes", "tmp", "node_modules"}
 
         file_count = 0
         total_uncompressed = 0
 
-        with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in hermes_home.rglob("*"):
-                if file_path.is_file():
-                    relative_path = file_path.relative_to(hermes_home)
-                    if any(part in excluded_dirs for part in relative_path.parts):
-                        continue
-                    try:
-                        file_path.relative_to(dest_dir)
-                        continue
-                    except ValueError:
-                        pass
-                    
-                    try:
-                        file_size = file_path.stat().st_size
-                        total_uncompressed += file_size
-                        zipf.write(file_path, relative_path)
-                        file_count += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to include file {file_path}: {e}")
+        try:
+            with zipfile.ZipFile(tmp_backup_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                if hermes_home.exists():
+                    for file_path in hermes_home.rglob("*"):
+                        if file_path.is_file():
+                            try:
+                                relative_path = file_path.relative_to(hermes_home)
+                            except ValueError:
+                                continue
+                            if any(part in excluded_dirs for part in relative_path.parts):
+                                continue
+                            try:
+                                file_path.relative_to(dest_dir)
+                                continue
+                            except ValueError:
+                                pass
+                            
+                            try:
+                                file_size = file_path.stat().st_size
+                                total_uncompressed += file_size
+                                zipf.write(file_path, relative_path)
+                                file_count += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to include file {file_path}: {e}")
 
-        compressed_size = backup_path.stat().st_size
-        ratio = (compressed_size / total_uncompressed * 100) if total_uncompressed > 0 else 0
-        logger.info(
-            f"Backup archive created: {backup_path.name} | "
-            f"Files: {file_count} | Uncompressed: {total_uncompressed}B | "
-            f"Compressed: {compressed_size}B ({ratio:.1f}% of original)"
-        )
+            compressed_size = tmp_backup_path.stat().st_size
+            ratio = (compressed_size / total_uncompressed * 100) if total_uncompressed > 0 else 0
+            
+            # Atomic rename upon successful write
+            tmp_backup_path.replace(final_backup_path)
 
-        # Generate SHA256 checksum sidecar file
-        sha256_hash = hashlib.sha256()
-        with open(backup_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        checksum = sha256_hash.hexdigest()
-        
-        checksum_path = dest_dir / f"{backup_path.name}.sha256"
-        checksum_path.write_text(f"{checksum}  {backup_path.name}\n", encoding="utf-8")
-        logger.debug(f"Generated SHA256 checksum sidecar: {checksum_path.name}")
+            logger.info(
+                f"Backup archive created: {final_backup_path.name} | "
+                f"Files: {file_count} | Uncompressed: {total_uncompressed}B | "
+                f"Compressed: {compressed_size}B ({ratio:.1f}% of original)"
+            )
 
-        return backup_path
+            # Generate SHA256 checksum sidecar file
+            sha256_hash = hashlib.sha256()
+            with open(final_backup_path, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            checksum = sha256_hash.hexdigest()
+            
+            checksum_path = dest_dir / f"{final_backup_path.name}.sha256"
+            checksum_path.write_text(f"{checksum}  {final_backup_path.name}\n", encoding="utf-8")
+            logger.debug(f"Generated SHA256 checksum sidecar: {checksum_path.name}")
+
+            return final_backup_path
+
+        except Exception as e:
+            if tmp_backup_path.exists():
+                try:
+                    tmp_backup_path.unlink()
+                except Exception:
+                    pass
+            logger.error(f"Failed to create zip backup: {e}")
+            raise
 
     def _notify_user(self, message: str):
         """Sends a notification toast/popup to Hermes Desktop or logs to TUI gateway."""
@@ -113,45 +147,53 @@ class ConfigBackupPlugin:
                 logger.error(f"Failed to dispatch desktop popup notification: {e}")
 
     def _run_backup_and_verify(self, is_startup=False):
-        settings = self._get_settings()
-        dest_dir = Path(settings["destination"])
-        
-        # 1. Gather existing backups before making a new one
-        existing = self._get_existing_backups(dest_dir)
-        
-        # Calculate average size of the last up-to 3 backups if they exist
-        last_three = existing[:3]
-        avg_size = 0.0
-        if last_three:
-            total_size = sum(b.stat().st_size for b in last_three if b.exists())
-            avg_size = total_size / len(last_three)
+        with self._lock:
+            settings = self._get_settings()
+            dest_dir = Path(settings["destination"])
+            
+            # 1. Gather existing backups before making a new one
+            existing = self._get_existing_backups(dest_dir)
+            
+            # Calculate average size of the last up-to 3 backups if they exist safely
+            last_three = existing[:3]
+            avg_size = 0.0
+            if last_three:
+                sizes = []
+                for b in last_three:
+                    try:
+                        if b.exists():
+                            sizes.append(b.stat().st_size)
+                    except Exception as e:
+                        logger.warning(f"Could not stat backup file {b.name}: {e}")
+                if sizes:
+                    avg_size = sum(sizes) / len(sizes)
 
-        # 2. Create the new backup
-        try:
-            logger.info("Creating new Hermes configuration backup...")
-            new_backup_path = self._create_zip_backup(dest_dir)
-            new_size = new_backup_path.stat().st_size
-            logger.info(f"New backup verified: {new_backup_path.name} ({new_size} bytes)")
+            # 2. Create the new backup
+            try:
+                logger.info("Creating new Hermes configuration backup...")
+                new_backup_path = self._create_zip_backup(dest_dir)
+                new_size = new_backup_path.stat().st_size
+                logger.info(f"New backup verified: {new_backup_path.name} ({new_size} bytes)")
 
-            # 3. Compare with average if we had previous backups to compare against
-            if avg_size > 0:
-                diff_ratio = abs(new_size - avg_size) / avg_size
-                logger.info(f"Backup size comparison -> New: {new_size}B, Last 3 Avg: {avg_size:.1f}B, Variance: {diff_ratio * 100:.1f}%")
+                # 3. Compare with average if we had previous backups to compare against
+                if avg_size > 0:
+                    diff_ratio = abs(new_size - avg_size) / avg_size
+                    logger.info(f"Backup size comparison -> New: {new_size}B, Last 3 Avg: {avg_size:.1f}B, Variance: {diff_ratio * 100:.1f}%")
 
-                if diff_ratio >= 0.20:
-                    warning_msg = (
-                        "The size of the last Hermes config backup has changed by 20% or more. "
-                        "You may want to check your config, skills, memories, etc. "
-                        "If you've created a lot of skills or memories in your last few Hermes sessions, "
-                        "you can probably ignore this."
-                    )
-                    self._notify_user(warning_msg)
+                    if diff_ratio >= 0.20:
+                        warning_msg = (
+                            "The size of the last Hermes config backup has changed by 20% or more. "
+                            "You may want to check your config, skills, memories, etc. "
+                            "If you've created a lot of skills or memories in your last few Hermes sessions, "
+                            "you can probably ignore this."
+                        )
+                        self._notify_user(warning_msg)
 
-            # 4. Prune old backups past max_keep (30)
-            self._rotate_old_backups(dest_dir, settings["max_keep"])
+                # 4. Prune old backups past max_keep
+                self._rotate_old_backups(dest_dir, settings["max_keep"])
 
-        except Exception as e:
-            logger.error(f"Failed during backup generation or size comparison: {e}")
+            except Exception as e:
+                logger.error(f"Failed during backup generation or size comparison: {e}")
 
     def _startup_backup_and_check(self):
         time.sleep(3)
@@ -197,7 +239,6 @@ class ConfigBackupPlugin:
         """Synchronous runner for testing backup creation and verification."""
         settings = self._get_settings()
         settings["destination"] = str(dest_dir)
-        # Temporarily override dest for test
         return self._create_zip_backup(dest_dir)
 
 plugin_class = ConfigBackupPlugin
