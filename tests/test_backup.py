@@ -229,3 +229,21 @@ def test_health_status_action_returns_data(tmp_path, mock_hermes_home, monkeypat
     result = plugin.handle_action("health_status")
     assert result["status"] == "success"
     assert result["data"]["backup_count"] == 1
+
+def test_size_anomaly_notification(tmp_path, mock_hermes_home, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(mock_hermes_home))
+    dest_dir = tmp_path / "backups"
+
+    ctx = MockContext({"plugins": {"config_backup": {"backup_destination": str(dest_dir)}}})
+    plugin = ConfigBackupPlugin(context=ctx)
+
+    # First backup is small.
+    plugin.run_backup_sync(dest_dir, hermes_home=mock_hermes_home)
+
+    # Add a large file so the next backup differs by >= 20%.
+    (mock_hermes_home / "big_file.txt").write_text("x" * (1024 * 1024), encoding="utf-8")
+
+    ctx.notifications.clear()
+    plugin._run_backup_and_verify()
+
+    assert any("changed by 20%" in n["message"] for n in ctx.notifications)
